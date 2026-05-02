@@ -1023,11 +1023,43 @@ class PubChemServer {
 
   // Simplified implementation handlers (placeholder implementations)
   private async handleSearchByInchi(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'InChI search not yet implemented', args }, null, 2) }] };
+    try {
+      let response;
+      if (typeof args.inchi === 'string' && args.inchi.startsWith('InChI=')) {
+        // Full InChI string — POST required
+        response = await this.apiClient.post(
+          '/compound/inchi/cids/JSON',
+          `inchi=${encodeURIComponent(args.inchi)}`,
+          { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+        );
+      } else {
+        // InChI Key (27-char hash)
+        response = await this.apiClient.get(`/compound/inchikey/${encodeURIComponent(args.inchi)}/cids/JSON`);
+      }
+      const cids: number[] = response.data?.IdentifierList?.CID ?? [];
+      if (cids.length === 0) {
+        return { content: [{ type: 'text', text: JSON.stringify({ message: 'No compound found', inchi: args.inchi }, null, 2) }] };
+      }
+      const details = await this.apiClient.get(`/compound/cid/${cids[0]}/property/MolecularFormula,MolecularWeight,CanonicalSMILES,IUPACName/JSON`);
+      return { content: [{ type: 'text', text: JSON.stringify({ query: args.inchi, cid: cids[0], all_cids: cids, details: details.data }, null, 2) }] };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `InChI search failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   }
 
   private async handleSearchByCasNumber(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'CAS search not yet implemented', args }, null, 2) }] };
+    try {
+      // PubChem accepts CAS Registry Numbers as compound names
+      const response = await this.apiClient.get(`/compound/name/${encodeURIComponent(args.cas_number)}/cids/JSON`);
+      const cids: number[] = response.data?.IdentifierList?.CID ?? [];
+      if (cids.length === 0) {
+        return { content: [{ type: 'text', text: JSON.stringify({ message: 'No compound found for CAS number', cas_number: args.cas_number }, null, 2) }] };
+      }
+      const details = await this.apiClient.get(`/compound/cid/${cids[0]}/property/MolecularFormula,MolecularWeight,CanonicalSMILES,IUPACName/JSON`);
+      return { content: [{ type: 'text', text: JSON.stringify({ cas_number: args.cas_number, cid: cids[0], details: details.data }, null, 2) }] };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `CAS search failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   }
 
   private async handleGetCompoundSynonyms(args: any) {
@@ -1085,11 +1117,29 @@ class PubChemServer {
   }
 
   private async handleSubstructureSearch(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Substructure search not yet implemented', args }, null, 2) }] };
+    try {
+      const maxRecords = args.max_records ?? 100;
+      const response = await this.apiClient.get(
+        `/compound/substructure/smiles/${encodeURIComponent(args.smiles)}/cids/JSON?MaxRecords=${maxRecords}`
+      );
+      const cids: number[] = response.data?.IdentifierList?.CID ?? [];
+      return { content: [{ type: 'text', text: JSON.stringify({ query_smiles: args.smiles, total_hits: cids.length, cids }, null, 2) }] };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `Substructure search failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   }
 
   private async handleSuperstructureSearch(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Superstructure search not yet implemented', args }, null, 2) }] };
+    try {
+      const maxRecords = args.max_records ?? 100;
+      const response = await this.apiClient.get(
+        `/compound/superstructure/smiles/${encodeURIComponent(args.smiles)}/cids/JSON?MaxRecords=${maxRecords}`
+      );
+      const cids: number[] = response.data?.IdentifierList?.CID ?? [];
+      return { content: [{ type: 'text', text: JSON.stringify({ query_smiles: args.smiles, total_hits: cids.length, cids }, null, 2) }] };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `Superstructure search failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   }
 
   private async handleGet3dConformers(args: any) {
@@ -1178,7 +1228,20 @@ class PubChemServer {
 
   // Placeholder implementations for remaining methods
   private async handleCalculateDescriptors(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Descriptor calculation not yet implemented', args }, null, 2) }] };
+    try {
+      const type = args.descriptor_type ?? 'all';
+      const propSets: Record<string, string> = {
+        basic:       'MolecularFormula,MolecularWeight,XLogP,TPSA,HBondDonorCount,HBondAcceptorCount,RotatableBondCount,HeavyAtomCount,Complexity,Charge',
+        topological: 'MolecularFormula,MolecularWeight,Complexity,HBondDonorCount,HBondAcceptorCount,RotatableBondCount,HeavyAtomCount,AtomStereoCount,BondStereoCount,CovalentUnitCount,TPSA,XLogP',
+        '3d':        'Volume3D,XStericQuadrupole3D,YStericQuadrupole3D,ZStericQuadrupole3D,FeatureCount3D,FeatureAcceptorCount3D,FeatureDonorCount3D,FeatureAnionCount3D,FeatureCationCount3D,FeatureRingCount3D,FeatureHydrophobeCount3D',
+        all:         'MolecularFormula,MolecularWeight,CanonicalSMILES,IsomericSMILES,InChI,InChIKey,IUPACName,XLogP,ExactMass,MonoisotopicMass,TPSA,Complexity,Charge,HBondDonorCount,HBondAcceptorCount,RotatableBondCount,HeavyAtomCount,AtomStereoCount,DefinedAtomStereoCount,UndefinedAtomStereoCount,BondStereoCount,CovalentUnitCount,Volume3D,FeatureCount3D,FeatureAcceptorCount3D,FeatureDonorCount3D,FeatureRingCount3D,FeatureHydrophobeCount3D',
+      };
+      const props = propSets[type] ?? propSets['all'];
+      const response = await this.apiClient.get(`/compound/cid/${args.cid}/property/${props}/JSON`);
+      return { content: [{ type: 'text', text: JSON.stringify({ cid: args.cid, descriptor_type: type, descriptors: response.data?.PropertyTable?.Properties?.[0] ?? {} }, null, 2) }] };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `Descriptor calculation failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   }
 
   // PHASE 3 — predict_admet_properties: PubChem descriptors + QSAR models
@@ -1266,19 +1329,92 @@ class PubChemServer {
   }
 
   private async handleAssessDrugLikeness(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Drug-likeness assessment not yet implemented', args }, null, 2) }] };
+    try {
+      let cid = args.cid;
+      if (!cid && args.smiles) {
+        const cidResp = await this.apiClient.get(`/compound/smiles/${encodeURIComponent(args.smiles)}/cids/JSON`);
+        cid = cidResp.data?.IdentifierList?.CID?.[0];
+      }
+      if (!cid) throw new Error('Provide cid or smiles');
+      const r = await this.apiClient.get(`/compound/cid/${cid}/property/MolecularWeight,XLogP,HBondDonorCount,HBondAcceptorCount,RotatableBondCount,TPSA,MolecularFormula/JSON`);
+      const p = r.data?.PropertyTable?.Properties?.[0] ?? {};
+      const mw   = parseFloat(p.MolecularWeight ?? 0);
+      const logP = parseFloat(p.XLogP ?? 0);
+      const hbd  = parseInt(p.HBondDonorCount ?? 0);
+      const hba  = parseInt(p.HBondAcceptorCount ?? 0);
+      const rotB = parseInt(p.RotatableBondCount ?? 0);
+      const tpsa = parseFloat(p.TPSA ?? 0);
+      const lipinskiViolations = [mw > 500, logP > 5, hbd > 5, hba > 10].filter(Boolean).length;
+      const veberPass = rotB <= 10 && tpsa <= 140;
+      const eganPass  = logP <= 5.88 && tpsa <= 131.6;
+      const overall = lipinskiViolations <= 1 && veberPass ? 'drug-like' : lipinskiViolations <= 2 ? 'borderline' : 'non-drug-like';
+      return { content: [{ type: 'text', text: JSON.stringify({
+        cid, molecular_properties: p,
+        lipinski_ro5: { pass: lipinskiViolations <= 1, violations: lipinskiViolations, details: { mw_ok: mw <= 500, logP_ok: logP <= 5, hbd_ok: hbd <= 5, hba_ok: hba <= 10 } },
+        veber_rules:  { pass: veberPass, rotB_ok: rotB <= 10, tpsa_ok: tpsa <= 140 },
+        egan_model:   { pass: eganPass },
+        overall_druglikeness: overall,
+      }, null, 2) }] };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `Drug-likeness assessment failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   }
 
   private async handleAnalyzeMolecularComplexity(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Molecular complexity analysis not yet implemented', args }, null, 2) }] };
+    try {
+      const r = await this.apiClient.get(`/compound/cid/${args.cid}/property/Complexity,HeavyAtomCount,RotatableBondCount,AtomStereoCount,BondStereoCount,MolecularWeight,MolecularFormula/JSON`);
+      const p = r.data?.PropertyTable?.Properties?.[0] ?? {};
+      const score = parseFloat(p.Complexity ?? 0);
+      const level = score > 1000 ? 'very high' : score > 500 ? 'high' : score > 200 ? 'moderate' : 'low';
+      return { content: [{ type: 'text', text: JSON.stringify({
+        cid: args.cid, complexity_score: score, complexity_level: level, properties: p,
+        interpretation: `Bertz/Hendrickson complexity ${score} (${level} synthetic challenge)`,
+      }, null, 2) }] };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `Molecular complexity analysis failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   }
 
   private async handleGetPharmacophoreFeatures(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Pharmacophore features not yet implemented', args }, null, 2) }] };
+    try {
+      const [feat3d, chem] = await Promise.all([
+        this.apiClient.get(`/compound/cid/${args.cid}/property/FeatureCount3D,FeatureAcceptorCount3D,FeatureDonorCount3D,FeatureAnionCount3D,FeatureCationCount3D,FeatureRingCount3D,FeatureHydrophobeCount3D,Volume3D/JSON`),
+        this.apiClient.get(`/compound/cid/${args.cid}/property/CanonicalSMILES,XLogP,TPSA,HBondDonorCount,HBondAcceptorCount/JSON`),
+      ]);
+      return { content: [{ type: 'text', text: JSON.stringify({
+        cid: args.cid,
+        pharmacophore_3d: feat3d.data?.PropertyTable?.Properties?.[0] ?? {},
+        binding_properties: chem.data?.PropertyTable?.Properties?.[0] ?? {},
+        disclaimer: 'Feature counts from PubChem 3D conformer. For full pharmacophore modelling use Phase, LigandScout, or ZINCPharmer.',
+      }, null, 2) }] };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `Pharmacophore feature retrieval failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   }
 
   private async handleSearchBioassays(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Bioassay search not yet implemented', args }, null, 2) }] };
+    try {
+      const maxRecords = args.max_records ?? 100;
+      let endpoint = '';
+      if (args.target)      endpoint = `/assay/target/genesymbol/${encodeURIComponent(args.target)}/aids/JSON?MaxRecords=${maxRecords}`;
+      else if (args.source) endpoint = `/assay/sourcename/${encodeURIComponent(args.source)}/aids/JSON?MaxRecords=${maxRecords}`;
+      else if (args.query)  endpoint = `/assay/description/${encodeURIComponent(args.query)}/aids/JSON?MaxRecords=${maxRecords}`;
+      else return { content: [{ type: 'text', text: JSON.stringify({ message: 'Provide at least one of: query, target, source' }, null, 2) }] };
+      const response = await this.apiClient.get(endpoint);
+      const aids: number[] = response.data?.IdentifierList?.AID ?? [];
+      const sampleDetails = await Promise.all(
+        aids.slice(0, 5).map((aid: number) =>
+          this.apiClient.get(`/assay/aid/${aid}/description/JSON`).catch(() => null)
+        )
+      );
+      return { content: [{ type: 'text', text: JSON.stringify({
+        total_found: aids.length,
+        aids: aids.slice(0, maxRecords),
+        sample_descriptions: sampleDetails.filter(Boolean).map((d: any) => d?.data),
+      }, null, 2) }] };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `Bioassay search failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   }
 
   private async handleGetAssayInfo(args: any) {
@@ -1389,11 +1525,45 @@ class PubChemServer {
   }
 
   private async handleSearchByTarget(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Target search not yet implemented', args }, null, 2) }] };
+    try {
+      const maxRecords = args.max_records ?? 100;
+      const assayResp = await this.apiClient.get(`/assay/target/genesymbol/${encodeURIComponent(args.target)}/aids/JSON?MaxRecords=20`);
+      const aids: number[] = assayResp.data?.IdentifierList?.AID ?? [];
+      if (aids.length === 0) {
+        return { content: [{ type: 'text', text: JSON.stringify({ message: 'No assays found for target', target: args.target }, null, 2) }] };
+      }
+      const compResp = await this.apiClient.get(`/assay/aid/${aids[0]}/cids/JSON?cids_type=active&MaxRecords=${maxRecords}`);
+      const cids: number[] = compResp.data?.InformationList?.Information?.[0]?.CID
+                          ?? compResp.data?.IdentifierList?.CID
+                          ?? [];
+      return { content: [{ type: 'text', text: JSON.stringify({
+        target: args.target, relevant_aids: aids,
+        active_cids_from_top_assay: cids.slice(0, maxRecords), total_active: cids.length,
+      }, null, 2) }] };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `Target search failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   }
 
   private async handleCompareActivityProfiles(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Activity profile comparison not yet implemented', args }, null, 2) }] };
+    try {
+      const profiles = await Promise.all(
+        args.cids.map(async (cid: number) => {
+          const [props, bio] = await Promise.all([
+            this.apiClient.get(`/compound/cid/${cid}/property/MolecularWeight,XLogP,TPSA,HBondDonorCount,HBondAcceptorCount/JSON`).catch(() => null),
+            this.apiClient.get(`/compound/cid/${cid}/assaysummary/JSON`).catch(() => null),
+          ]);
+          return {
+            cid,
+            properties: props?.data?.PropertyTable?.Properties?.[0] ?? {},
+            assay_summary: bio?.data,
+          };
+        })
+      );
+      return { content: [{ type: 'text', text: JSON.stringify({ compared_cids: args.cids, activity_profiles: profiles }, null, 2) }] };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `Activity profile comparison failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   }
 
   // PHASE 4 — get_safety_data fixed: ?heading=GHS+Classification (not the full TOC)
@@ -1487,27 +1657,118 @@ class PubChemServer {
   }
 
   private async handleGetToxicityInfo(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Toxicity info not yet implemented', args }, null, 2) }] };
+    try {
+      const url = `https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/data/compound/${args.cid}/JSON?heading=Toxicity`;
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error(`PUG View HTTP ${resp.status}`);
+      const data: any = await resp.json();
+      const sections = data?.Record?.Section ?? [];
+      const toxSection = sections.find((s: any) =>
+        ['Toxicity', 'Safety and Hazards', 'Acute Effects'].includes(s.TOCHeading)
+      );
+      return { content: [{ type: 'text', text: JSON.stringify({
+        cid: args.cid, source: 'PubChem PUG View',
+        toxicity: toxSection ?? { message: 'No toxicity data in PUG View for this compound' },
+      }, null, 2) }] };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `Toxicity info failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   }
 
   private async handleAssessEnvironmentalFate(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Environmental fate assessment not yet implemented', args }, null, 2) }] };
+    try {
+      const [propsResp, pugResp] = await Promise.all([
+        this.apiClient.get(`/compound/cid/${args.cid}/property/XLogP,MolecularWeight,TPSA,HBondDonorCount/JSON`),
+        fetch(`https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/data/compound/${args.cid}/JSON?heading=Environmental+Fate+and+Exposure`)
+          .then(r => r.ok ? r.json() : null).catch(() => null),
+      ]);
+      const p = propsResp.data?.PropertyTable?.Properties?.[0] ?? {};
+      const logP = parseFloat(p.XLogP ?? 0);
+      const mw   = parseFloat(p.MolecularWeight ?? 0);
+      const pugData: any = pugResp;
+      const envSection = pugData?.Record?.Section?.find((s: any) =>
+        s.TOCHeading?.toLowerCase().includes('environmental')
+      );
+      return { content: [{ type: 'text', text: JSON.stringify({
+        cid: args.cid,
+        bioaccumulation_potential: logP > 5 ? 'high (logP > 5)' : logP > 3 ? 'moderate' : 'low',
+        mobility_in_soil: p.TPSA > 75 ? 'low mobility' : 'moderate-high mobility',
+        key_properties: { logP, mw, tpsa: p.TPSA },
+        pug_view_env_data: envSection ?? { message: 'No environmental data in PUG View' },
+        disclaimer: 'Preliminary estimates only. Use EPI Suite or EPISTAT for regulatory-grade assessment.',
+      }, null, 2) }] };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `Environmental fate assessment failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   }
 
   private async handleGetRegulatoryInfo(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Regulatory info not yet implemented', args }, null, 2) }] };
+    try {
+      const [xrefResp, pugResp] = await Promise.all([
+        this.apiClient.get(`/compound/cid/${args.cid}/xrefs/RegistryID,MIMID,GeneID/JSON`).catch(() => null),
+        fetch(`https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/data/compound/${args.cid}/JSON?heading=Use+and+Manufacturing`)
+          .then(r => r.ok ? r.json() : null).catch(() => null),
+      ]);
+      const pugData: any = pugResp;
+      const sections = pugData?.Record?.Section ?? [];
+      const regulatorySection = sections.find((s: any) =>
+        ['Use and Manufacturing', 'Drug and Medication Information', 'Regulatory Information'].some(h => s.TOCHeading?.includes(h))
+      );
+      return { content: [{ type: 'text', text: JSON.stringify({
+        cid: args.cid, source: 'PubChem PUG View + Cross-references',
+        cross_references: xrefResp?.data ?? {},
+        regulatory_data: regulatorySection ?? { message: 'No regulatory data in PUG View for this compound' },
+        external_links: {
+          pubchem_url: `https://pubchem.ncbi.nlm.nih.gov/compound/${args.cid}`,
+          fda_drug_search: `https://api.fda.gov/drug/label.json?search=openfda.chem_name:""`,
+        },
+      }, null, 2) }] };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `Regulatory info failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   }
 
   private async handleGetExternalReferences(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'External references not yet implemented', args }, null, 2) }] };
+    try {
+      const response = await this.apiClient.get(`/compound/cid/${args.cid}/xrefs/RegistryID,RN,PubMedID,MMDBID,ProteinGI,NucleotideGI,TaxonomyID,MIMID,GeneID,PatentID/JSON`);
+      return { content: [{ type: 'text', text: JSON.stringify({ cid: args.cid, external_references: response.data }, null, 2) }] };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `External references failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   }
 
   private async handleSearchPatents(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Patent search not yet implemented', args }, null, 2) }] };
+    try {
+      let cid = args.cid;
+      if (!cid && args.query) {
+        const cidResp = await this.apiClient.get(`/compound/name/${encodeURIComponent(args.query)}/cids/JSON`);
+        cid = cidResp.data?.IdentifierList?.CID?.[0];
+      }
+      if (!cid) throw new Error('Provide cid or query');
+      const response = await this.apiClient.get(`/compound/cid/${cid}/xrefs/PatentID/JSON`);
+      const patents: string[] = response.data?.InformationList?.Information?.[0]?.PatentID ?? [];
+      return { content: [{ type: 'text', text: JSON.stringify({
+        cid, total_patents: patents.length, patent_ids: patents.slice(0, 200),
+        note: patents.length > 200 ? `Showing 200 of ${patents.length} patents` : undefined,
+      }, null, 2) }] };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `Patent search failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   }
 
   private async handleGetLiteratureReferences(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Literature references not yet implemented', args }, null, 2) }] };
+    try {
+      const response = await this.apiClient.get(`/compound/cid/${args.cid}/xrefs/PubMedID/JSON`);
+      const pmids: number[] = response.data?.InformationList?.Information?.[0]?.PubMedID ?? [];
+      return { content: [{ type: 'text', text: JSON.stringify({
+        cid: args.cid, total_references: pmids.length,
+        pubmed_ids: pmids.slice(0, 100),
+        pubmed_search_url: `https://pubmed.ncbi.nlm.nih.gov/?linkname=pccompound_pubmed&from_uid=${args.cid}`,
+        note: pmids.length > 100 ? `Showing first 100 of ${pmids.length} PubMed references` : undefined,
+      }, null, 2) }] };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `Literature references failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   }
 
   // PHASE 6 — batch_compound_lookup: XLogP and TPSA added to property list
