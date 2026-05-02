@@ -829,7 +829,7 @@ class PubChemServer {
   }
 
   // Chemical Search & Retrieval handlers
-  // FÁZIS 1 — search_compounds javítva: helyes PUG REST végpontok + PC_Compounds feldolgozás
+  // PHASE 1 — search_compounds fixed: correct PUG REST endpoints + PC_Compounds processing
   private async handleSearchCompounds(args: any) {
     if (!isValidCompoundSearchArgs(args)) {
       throw new McpError(ErrorCode.InvalidParams, 'Invalid compound search arguments');
@@ -839,25 +839,25 @@ class PubChemServer {
     const searchType = (args.search_type as string) || 'name';
     const maxRecords = (args.max_records as number) || 10;
 
-    if (!query) throw new McpError(ErrorCode.InvalidParams, "A 'query' paraméter kötelező.");
+    if (!query) throw new McpError(ErrorCode.InvalidParams, "The 'query' parameter is required.");
 
     const encoded = encodeURIComponent(query);
 
-    // Formula keresés: PubChem aszinkron ListKey protokoll
+    // Formula search: PubChem async ListKey protocol
     if (searchType === 'formula') {
       let cids: number[] = [];
       try {
-        // 1. lépés: keresés indítása → Waiting.ListKey
+        // Step 1: initiate search → Waiting.ListKey
         const r1 = await axios.get(
           `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/formula/${encoded}/JSON`,
           { timeout: 15000 }
         );
         const listKey = r1.data?.Waiting?.ListKey;
         if (!listKey) {
-          // Ritka: azonnali eredmény (CIDList)
+          // Rare: immediate result (CIDList)
           cids = r1.data?.IdentifierList?.CID ?? [];
         } else {
-          // 2. lépés: polling (max 3 próba, 3 mp közönként)
+          // Step 2: polling (max 3 attempts, 3 s apart)
           for (let attempt = 0; attempt < 3; attempt++) {
             await new Promise(res => setTimeout(res, 3000));
             try {
@@ -874,13 +874,13 @@ class PubChemServer {
         }
       } catch (err: any) {
         if (err.response?.status === 404) {
-          return { content: [{ type: 'text', text: JSON.stringify({ query, search_type: searchType, result_count: 0, compounds: [], message: `Nem található vegyület: "${query}"` }) }] };
+          return { content: [{ type: 'text', text: JSON.stringify({ query, search_type: searchType, result_count: 0, compounds: [], message: `No compound found for: "${query}"` }) }] };
         }
         throw new McpError(ErrorCode.InternalError, `Failed formula search: ${err instanceof Error ? err.message : 'Unknown error'}`);
       }
 
       if (cids.length === 0) {
-        return { content: [{ type: 'text', text: JSON.stringify({ query, search_type: searchType, result_count: 0, compounds: [], message: `Nem található vegyület a képletre: "${query}"` }) }] };
+        return { content: [{ type: 'text', text: JSON.stringify({ query, search_type: searchType, result_count: 0, compounds: [], message: `No compound found for formula: "${query}"` }) }] };
       }
 
       // Property fetch a top N CID-hez
@@ -902,7 +902,7 @@ class PubChemServer {
       };
     }
 
-    // name / synonym / cas keresés: PC_Compounds JSON
+    // name / synonym / cas search: PC_Compounds JSON
     let rawData: any;
     try {
       const response = await axios.get(
@@ -917,7 +917,7 @@ class PubChemServer {
             type: 'text',
             text: JSON.stringify({
               query, search_type: searchType, result_count: 0, compounds: [],
-              message: `Nem található vegyület: "${query}"`
+              message: `No compound found: "${query}"`
             })
           }]
         };
@@ -1181,11 +1181,11 @@ class PubChemServer {
     return { content: [{ type: 'text', text: JSON.stringify({ message: 'Descriptor calculation not yet implemented', args }, null, 2) }] };
   }
 
-  // FÁZIS 3 — predict_admet_properties: PubChem leírók + QSAR modellek
+  // PHASE 3 — predict_admet_properties: PubChem descriptors + QSAR models
   private async handlePredictAdmetProperties(args: any) {
     const typedArgs = args as Record<string, any>;
     const cid = Number(typedArgs.cid);
-    if (!cid) throw new McpError(ErrorCode.InvalidParams, "A 'cid' paraméter kötelező.");
+    if (!cid) throw new McpError(ErrorCode.InvalidParams, "The 'cid' parameter is required.");
 
     const propUrl = `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/${cid}/property/` +
       `MolecularWeight,XLogP,TPSA,HBondDonorCount,HBondAcceptorCount,` +
@@ -1196,12 +1196,12 @@ class PubChemServer {
       const response = await axios.get(propUrl, { timeout: 15000 });
       propData = response.data;
     } catch (err: any) {
-      if (err.response?.status === 404) throw new McpError(ErrorCode.InvalidParams, `CID ${cid} nem található.`);
+      if (err.response?.status === 404) throw new McpError(ErrorCode.InvalidParams, `CID ${cid} not found.`);
       throw new McpError(ErrorCode.InternalError, `Failed to fetch descriptors: ${err instanceof Error ? err.message : 'Unknown error'}`);
     }
 
     const p = propData?.PropertyTable?.Properties?.[0];
-    if (!p) throw new McpError(ErrorCode.InternalError, 'Nem sikerült lekérni a leírókat.');
+    if (!p) throw new McpError(ErrorCode.InternalError, 'Failed to retrieve molecular descriptors.');
 
     const mw    = p.MolecularWeight    ?? 0;
     const logP  = p.XLogP              ?? 0;
@@ -1230,7 +1230,7 @@ class PubChemServer {
                 highPerm && !highSol ? 'II' :
                 !highPerm && highSol ? 'III': 'IV';
 
-    // SA score közelítés
+    // SA score approximation
     const sa = heavy <= 20 && rotB <= 5  ? 'low'        :
                heavy <= 35 && cmplx < 500 ? 'medium'     :
                heavy > 35  || cmplx > 1000 ? 'high'      : 'medium-high';
@@ -1257,9 +1257,9 @@ class PubChemServer {
             pgp_substrate_likely:   mw > 400 && (hbd + hba) > 8,
           },
           synthetic_accessibility: sa,
-          disclaimer: 'QSAR-modell alapú becslések — NEM kísérleti adatok. ' +
-            'Klinikai döntésekhez validált mérések szükségesek. ' +
-            'Ajánlott eszközök: pkCSM, SwissADME, ADMETlab 3.0.'
+          disclaimer: 'QSAR model-based estimates — NOT experimental data. ' +
+            'Validated measurements are required for clinical decisions. ' +
+            'Recommended tools: pkCSM, SwissADME, ADMETlab 3.0.'
         })
       }]
     };
@@ -1300,15 +1300,15 @@ class PubChemServer {
     }
   }
 
-  // FÁZIS 2 — get_compound_bioactivities: /assaysummary/JSON végpont
-  // Valódi PubChem válasz formátum: Table.Row[].Cell[] (indexelt oszlopok)
+  // PHASE 2 — get_compound_bioactivities: /assaysummary/JSON endpoint
+  // Real PubChem response format: Table.Row[].Cell[] (indexed columns)
   // Columns: AID(0), PanelMemberID(1), SID(2), CID(3), ActivityOutcome(4),
   //          TargetAccession(5), TargetGeneID(6), ActivityValue[uM](7),
   //          ActivityName(8), AssayName(9), AssayType(10), PubMedID(11), RNAi(12)
   private async handleGetCompoundBioactivities(args: any) {
     const typedArgs = args as Record<string, any>;
     const cid = Number(typedArgs.cid);
-    if (!cid) throw new McpError(ErrorCode.InvalidParams, "A 'cid' paraméter kötelező.");
+    if (!cid) throw new McpError(ErrorCode.InvalidParams, "The 'cid' parameter is required.");
     const activityOutcome = typedArgs.activity_outcome as string | undefined;
     const maxRecords = Number(typedArgs.max_records ?? 50);
 
@@ -1322,7 +1322,7 @@ class PubChemServer {
         return {
           content: [{
             type: 'text',
-            text: JSON.stringify({ cid, activities: [], message: 'Nincs bioassay adat ehhez a CID-hez.' })
+            text: JSON.stringify({ cid, activities: [], message: 'No bioassay data found for this CID.' })
           }]
         };
       }
@@ -1345,7 +1345,7 @@ class PubChemServer {
     const TARGET_ACC_I = idx('Target Accession');
     const TARGET_GENE_I = idx('Target GeneID');
 
-    // Összes sor átalakítása
+    // Map all rows to structured objects
     const allActivities = rows.map((r: any) => {
       const cell: string[] = r.Cell ?? [];
       return {
@@ -1360,14 +1360,14 @@ class PubChemServer {
       };
     });
 
-    // Outcome eloszlás
+    // Outcome distribution
     const stats: Record<string, number> = {};
     for (const a of allActivities) {
       const o = a.outcome ?? 'unknown';
       stats[o] = (stats[o] ?? 0) + 1;
     }
 
-    // Opcionális szűrés activity_outcome alapján
+    // Optional filter by activity_outcome
     let filtered = allActivities;
     if (activityOutcome && activityOutcome !== 'all') {
       const f = activityOutcome.toLowerCase();
@@ -1396,7 +1396,7 @@ class PubChemServer {
     return { content: [{ type: 'text', text: JSON.stringify({ message: 'Activity profile comparison not yet implemented', args }, null, 2) }] };
   }
 
-  // FÁZIS 4 — get_safety_data javítva: ?heading=GHS+Classification (nem a teljes TOC)
+  // PHASE 4 — get_safety_data fixed: ?heading=GHS+Classification (not the full TOC)
   private async handleGetSafetyData(args: any) {
     if (!isValidCidArgs(args)) {
       throw new McpError(ErrorCode.InvalidParams, 'Invalid CID arguments');
@@ -1413,7 +1413,7 @@ class PubChemServer {
       ghsData = r.data;
     } catch (err: any) {
       if (err.response?.status !== 404) throw new McpError(ErrorCode.InternalError, `Failed to get safety data: ${err instanceof Error ? err.message : 'Unknown error'}`);
-      // 404 → próbáljuk a fallback headinget
+      // 404 → try fallback heading
     }
 
     // 2. Fallback: Safety and Hazards heading
@@ -1436,7 +1436,7 @@ class PubChemServer {
           text: JSON.stringify({
             cid,
             ghs_available: false,
-            message: 'Nem találhatók GHS biztonsági adatok ehhez a vegyülethez.'
+            message: 'No GHS safety data found for this compound.'
           })
         }]
       };
@@ -1510,7 +1510,7 @@ class PubChemServer {
     return { content: [{ type: 'text', text: JSON.stringify({ message: 'Literature references not yet implemented', args }, null, 2) }] };
   }
 
-  // FÁZIS 6 — batch_compound_lookup: XLogP és TPSA hozzáadva a property listához
+  // PHASE 6 — batch_compound_lookup: XLogP and TPSA added to property list
   private async handleBatchCompoundLookup(args: any) {
     if (!isValidBatchArgs(args)) {
       throw new McpError(ErrorCode.InvalidParams, 'Invalid batch arguments');
@@ -1521,7 +1521,7 @@ class PubChemServer {
       const cids = args.cids.slice(0, 200);
 
       if (operation === 'property') {
-        // Batch property fetch — egyetlen API hívás az összes CID-hez
+        // Batch property fetch — single API call for all CIDs
         const BATCH_PROPS = [
           'MolecularWeight', 'XLogP', 'TPSA', 'HBondDonorCount',
           'HBondAcceptorCount', 'RotatableBondCount', 'IUPACName',
@@ -1532,7 +1532,7 @@ class PubChemServer {
         return { content: [{ type: 'text', text: JSON.stringify({ operation, cid_count: cids.length, data: response.data }, null, 2) }] };
       }
 
-      // Egyéb műveletek (synonyms, classification, description) — egyenként
+      // Other operations (synonyms, classification, description) — one by one
       const results = [];
       for (const cid of cids.slice(0, 10)) {
         try {
