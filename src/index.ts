@@ -829,54 +829,129 @@ class PubChemServer {
   }
 
   // Chemical Search & Retrieval handlers
+  // FÁZIS 1 — search_compounds javítva: helyes PUG REST végpontok + PC_Compounds feldolgozás
   private async handleSearchCompounds(args: any) {
     if (!isValidCompoundSearchArgs(args)) {
       throw new McpError(ErrorCode.InvalidParams, 'Invalid compound search arguments');
     }
 
-    try {
-      const searchType = args.search_type || 'name';
-      const maxRecords = args.max_records || 100;
+    const query = args.query as string;
+    const searchType = (args.search_type as string) || 'name';
+    const maxRecords = (args.max_records as number) || 10;
 
-      const response = await this.apiClient.get(`/compound/${searchType}/${encodeURIComponent(args.query)}/cids/JSON`, {
-        params: {
-          MaxRecords: maxRecords,
-        },
-      });
+    if (!query) throw new McpError(ErrorCode.InvalidParams, "A 'query' paraméter kötelező.");
 
-      if (response.data?.IdentifierList?.CID?.length > 0) {
-        const cids = response.data.IdentifierList.CID.slice(0, 10);
-        const detailsResponse = await this.apiClient.get(`/compound/cid/${cids.join(',')}/property/MolecularFormula,MolecularWeight,CanonicalSMILES,IUPACName/JSON`);
+    const encoded = encodeURIComponent(query);
 
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                query: args.query,
-                search_type: searchType,
-                total_found: response.data.IdentifierList.CID.length,
-                details: detailsResponse.data,
-              }, null, 2),
-            },
-          ],
-        };
+    // Formula keresés: PubChem aszinkron ListKey protokoll
+    if (searchType === 'formula') {
+      let cids: number[] = [];
+      try {
+        // 1. lépés: keresés indítása → Waiting.ListKey
+        const r1 = await axios.get(
+          `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/formula/${encoded}/JSON`,
+          { timeout: 15000 }
+        );
+        const listKey = r1.data?.Waiting?.ListKey;
+        if (!listKey) {
+          // Ritka: azonnali eredmény (CIDList)
+          cids = r1.data?.IdentifierList?.CID ?? [];
+        } else {
+          // 2. lépés: polling (max 3 próba, 3 mp közönként)
+          for (let attempt = 0; attempt < 3; attempt++) {
+            await new Promise(res => setTimeout(res, 3000));
+            try {
+              const r2 = await axios.get(
+                `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/listkey/${listKey}/cids/JSON`,
+                { timeout: 10000 }
+              );
+              if (r2.data?.IdentifierList?.CID) {
+                cids = r2.data.IdentifierList.CID;
+                break;
+              }
+            } catch (_) { /* még fut */ }
+          }
+        }
+      } catch (err: any) {
+        if (err.response?.status === 404) {
+          return { content: [{ type: 'text', text: JSON.stringify({ query, search_type: searchType, result_count: 0, compounds: [], message: `Nem található vegyület: "${query}"` }) }] };
+        }
+        throw new McpError(ErrorCode.InternalError, `Failed formula search: ${err instanceof Error ? err.message : 'Unknown error'}`);
       }
 
+      if (cids.length === 0) {
+        return { content: [{ type: 'text', text: JSON.stringify({ query, search_type: searchType, result_count: 0, compounds: [], message: `Nem található vegyület a képletre: "${query}"` }) }] };
+      }
+
+      // Property fetch a top N CID-hez
+      const topCids = cids.slice(0, maxRecords);
+      const propUrl = `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/${topCids.join(',')}/property/MolecularFormula,MolecularWeight,IUPACName,CanonicalSMILES,InChIKey,XLogP/JSON`;
+      const propResp = await axios.get(propUrl, { timeout: 15000 });
+      const propList: any[] = propResp.data?.PropertyTable?.Properties ?? [];
+      const compounds = propList.map(p => ({
+        cid:               p.CID ?? null,
+        iupac_name:        p.IUPACName ?? null,
+        molecular_formula: p.MolecularFormula ?? null,
+        molecular_weight:  p.MolecularWeight ?? null,
+        smiles:            p.CanonicalSMILES ?? null,
+        inchikey:          p.InChIKey ?? null,
+      }));
+
       return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({ message: 'No compounds found', query: args.query }, null, 2),
-          },
-        ],
+        content: [{ type: 'text', text: JSON.stringify({ query, search_type: searchType, total_found: cids.length, result_count: compounds.length, compounds }) }]
       };
-    } catch (error) {
-      throw new McpError(
-        ErrorCode.InternalError,
-        `Failed to search compounds: ${error instanceof Error ? error.message : 'Unknown error'}`
-      );
     }
+
+    // name / synonym / cas keresés: PC_Compounds JSON
+    let rawData: any;
+    try {
+      const response = await axios.get(
+        `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/${encoded}/JSON`,
+        { timeout: 15000 }
+      );
+      rawData = response.data;
+    } catch (err: any) {
+      if (err.response?.status === 404) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              query, search_type: searchType, result_count: 0, compounds: [],
+              message: `Nem található vegyület: "${query}"`
+            })
+          }]
+        };
+      }
+      throw new McpError(ErrorCode.InternalError, `Failed to search compounds: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    }
+
+    // PC_Compounds tömb feldolgozása
+    const compounds = (rawData?.PC_Compounds ?? []).slice(0, maxRecords).map((c: any) => {
+      const cid = c.id?.id?.cid ?? null;
+      const props: Record<string, any> = {};
+      for (const p of c.props ?? []) {
+        const label = p.urn?.label;
+        const pname  = p.urn?.name;
+        const key   = pname ? `${label}_${pname}` : label;
+        const val   = p.value?.sval ?? p.value?.fval ?? p.value?.ival ?? null;
+        if (key && val !== null) props[key] = val;
+      }
+      return {
+        cid,
+        iupac_name:        props['IUPAC Name_Preferred'] ?? props['IUPAC Name_Traditional'] ?? null,
+        molecular_formula: props['Molecular Formula'] ?? null,
+        molecular_weight:  props['Molecular Weight'] ?? null,
+        smiles:            props['SMILES_Canonical'] ?? props['SMILES_Isomeric'] ?? null,
+        inchikey:          props['InChIKey_Standard'] ?? null,
+      };
+    });
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({ query, search_type: searchType, result_count: compounds.length, compounds })
+      }]
+    };
   }
 
   private async handleGetCompoundInfo(args: any) {
@@ -1106,8 +1181,88 @@ class PubChemServer {
     return { content: [{ type: 'text', text: JSON.stringify({ message: 'Descriptor calculation not yet implemented', args }, null, 2) }] };
   }
 
+  // FÁZIS 3 — predict_admet_properties: PubChem leírók + QSAR modellek
   private async handlePredictAdmetProperties(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'ADMET prediction not yet implemented', args }, null, 2) }] };
+    const typedArgs = args as Record<string, any>;
+    const cid = Number(typedArgs.cid);
+    if (!cid) throw new McpError(ErrorCode.InvalidParams, "A 'cid' paraméter kötelező.");
+
+    const propUrl = `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/${cid}/property/` +
+      `MolecularWeight,XLogP,TPSA,HBondDonorCount,HBondAcceptorCount,` +
+      `RotatableBondCount,HeavyAtomCount,Complexity,MolecularFormula/JSON`;
+
+    let propData: any;
+    try {
+      const response = await axios.get(propUrl, { timeout: 15000 });
+      propData = response.data;
+    } catch (err: any) {
+      if (err.response?.status === 404) throw new McpError(ErrorCode.InvalidParams, `CID ${cid} nem található.`);
+      throw new McpError(ErrorCode.InternalError, `Failed to fetch descriptors: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    }
+
+    const p = propData?.PropertyTable?.Properties?.[0];
+    if (!p) throw new McpError(ErrorCode.InternalError, 'Nem sikerült lekérni a leírókat.');
+
+    const mw    = p.MolecularWeight    ?? 0;
+    const logP  = p.XLogP              ?? 0;
+    const tpsa  = p.TPSA               ?? 0;
+    const hbd   = p.HBondDonorCount    ?? 0;
+    const hba   = p.HBondAcceptorCount ?? 0;
+    const rotB  = p.RotatableBondCount ?? 0;
+    const heavy = p.HeavyAtomCount     ?? 0;
+    const cmplx = p.Complexity         ?? 0;
+
+    // Lipinski Ro5
+    const ro5v = [mw > 500, logP > 5, hbd > 5, hba > 10].filter(Boolean).length;
+
+    // Clark (1999) BBB modell
+    const logBB = 0.152 * logP - 0.0148 * tpsa + 0.139;
+    const bbb   = logBB > 0.3 ? 'high' : logBB > -1.0 ? 'moderate' : 'low';
+
+    // PPB heurisztika
+    const ppb = (logP > 3 && tpsa < 80)  ? '>90%' :
+                (logP > 1 && tpsa < 120) ? '70-90%' : '<70%';
+
+    // BCS osztályozás
+    const highPerm = tpsa <= 75 && hbd <= 3;
+    const highSol  = logP < 3 && mw <= 500;
+    const bcs = highPerm && highSol  ? 'I'  :
+                highPerm && !highSol ? 'II' :
+                !highPerm && highSol ? 'III': 'IV';
+
+    // SA score közelítés
+    const sa = heavy <= 20 && rotB <= 5  ? 'low'        :
+               heavy <= 35 && cmplx < 500 ? 'medium'     :
+               heavy > 35  || cmplx > 1000 ? 'high'      : 'medium-high';
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          cid,
+          input_descriptors: { mw, logP, tpsa, hbd, hba, rotB, heavy, cmplx },
+          druglikeness: {
+            lipinski_ro5_pass:  ro5v <= 1,
+            ro5_violations:     ro5v,
+            veber_pass:         rotB <= 10 && tpsa <= 140,
+            egan_gi_absorption: tpsa <= 131.6 && logP <= 5.88,
+          },
+          admet_predictions: {
+            oral_absorption:        (tpsa <= 131.6 && logP <= 5.88) ? 'high' : 'low',
+            bcs_class:              bcs,
+            bbb_penetration:        bbb,
+            logBB_estimate:         parseFloat(logBB.toFixed(3)),
+            plasma_protein_binding: ppb,
+            cyp_inhibition_risk:    (logP > 3 && mw > 300 && mw < 600) ? 'moderate-high' : 'low-moderate',
+            pgp_substrate_likely:   mw > 400 && (hbd + hba) > 8,
+          },
+          synthetic_accessibility: sa,
+          disclaimer: 'QSAR-modell alapú becslések — NEM kísérleti adatok. ' +
+            'Klinikai döntésekhez validált mérések szükségesek. ' +
+            'Ajánlott eszközök: pkCSM, SwissADME, ADMETlab 3.0.'
+        })
+      }]
+    };
   }
 
   private async handleAssessDrugLikeness(args: any) {
@@ -1145,8 +1300,92 @@ class PubChemServer {
     }
   }
 
+  // FÁZIS 2 — get_compound_bioactivities: /assaysummary/JSON végpont
+  // Valódi PubChem válasz formátum: Table.Row[].Cell[] (indexelt oszlopok)
+  // Columns: AID(0), PanelMemberID(1), SID(2), CID(3), ActivityOutcome(4),
+  //          TargetAccession(5), TargetGeneID(6), ActivityValue[uM](7),
+  //          ActivityName(8), AssayName(9), AssayType(10), PubMedID(11), RNAi(12)
   private async handleGetCompoundBioactivities(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Bioactivity search not yet implemented', args }, null, 2) }] };
+    const typedArgs = args as Record<string, any>;
+    const cid = Number(typedArgs.cid);
+    if (!cid) throw new McpError(ErrorCode.InvalidParams, "A 'cid' paraméter kötelező.");
+    const activityOutcome = typedArgs.activity_outcome as string | undefined;
+    const maxRecords = Number(typedArgs.max_records ?? 50);
+
+    const url = `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/${cid}/assaysummary/JSON`;
+    let rawData: any;
+    try {
+      const response = await axios.get(url, { timeout: 20000 });
+      rawData = response.data;
+    } catch (err: any) {
+      if (err.response?.status === 404) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({ cid, activities: [], message: 'Nincs bioassay adat ehhez a CID-hez.' })
+          }]
+        };
+      }
+      throw new McpError(ErrorCode.InternalError, `Failed to get bioactivities: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    }
+
+    // A PubChem Table formátumú választ dolgozzuk fel
+    const table = rawData?.Table;
+    const cols: string[] = table?.Columns?.Column ?? [];
+    const rows: any[] = table?.Row ?? [];
+
+    // Oszlop index meghatározása
+    const idx = (name: string) => cols.indexOf(name);
+    const AID_I     = idx('AID');
+    const OUTCOME_I = idx('Activity Outcome');
+    const ACT_VAL_I = idx('Activity Value [uM]');
+    const ACT_NAME_I = idx('Activity Name');
+    const ASSAY_I   = idx('Assay Name');
+    const ASSAY_TYPE_I = idx('Assay Type');
+    const TARGET_ACC_I = idx('Target Accession');
+    const TARGET_GENE_I = idx('Target GeneID');
+
+    // Összes sor átalakítása
+    const allActivities = rows.map((r: any) => {
+      const cell: string[] = r.Cell ?? [];
+      return {
+        aid:            cell[AID_I] ?? null,
+        outcome:        cell[OUTCOME_I] ?? null,
+        activity_value: cell[ACT_VAL_I] || null,
+        activity_type:  cell[ACT_NAME_I] || null,
+        assay_name:     cell[ASSAY_I] || null,
+        assay_type:     cell[ASSAY_TYPE_I] || null,
+        target_accession: cell[TARGET_ACC_I] || null,
+        target_gene_id:   cell[TARGET_GENE_I] || null,
+      };
+    });
+
+    // Outcome eloszlás
+    const stats: Record<string, number> = {};
+    for (const a of allActivities) {
+      const o = a.outcome ?? 'unknown';
+      stats[o] = (stats[o] ?? 0) + 1;
+    }
+
+    // Opcionális szűrés activity_outcome alapján
+    let filtered = allActivities;
+    if (activityOutcome && activityOutcome !== 'all') {
+      const f = activityOutcome.toLowerCase();
+      filtered = allActivities.filter(a => a.outcome?.toLowerCase() === f);
+    }
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          cid,
+          total_assays: allActivities.length,
+          filtered_count: filtered.length,
+          outcome_distribution: stats,
+          activities: filtered.slice(0, maxRecords)
+        })
+      }]
+    };
   }
 
   private async handleSearchByTarget(args: any) {
@@ -1157,27 +1396,94 @@ class PubChemServer {
     return { content: [{ type: 'text', text: JSON.stringify({ message: 'Activity profile comparison not yet implemented', args }, null, 2) }] };
   }
 
+  // FÁZIS 4 — get_safety_data javítva: ?heading=GHS+Classification (nem a teljes TOC)
   private async handleGetSafetyData(args: any) {
     if (!isValidCidArgs(args)) {
       throw new McpError(ErrorCode.InvalidParams, 'Invalid CID arguments');
     }
+    const cid = Number(args.cid);
 
+    // 1. Kísérlet: GHS Classification heading (legpontosabb, <50 KB)
+    let ghsData: any = null;
     try {
-      const response = await this.apiClient.get(`/compound/cid/${args.cid}/classification/JSON`);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(response.data, null, 2),
-          },
-        ],
-      };
-    } catch (error) {
-      throw new McpError(
-        ErrorCode.InternalError,
-        `Failed to get safety data: ${error instanceof Error ? error.message : 'Unknown error'}`
+      const r = await axios.get(
+        `https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/data/compound/${cid}/JSON?heading=GHS+Classification`,
+        { timeout: 15000 }
       );
+      ghsData = r.data;
+    } catch (err: any) {
+      if (err.response?.status !== 404) throw new McpError(ErrorCode.InternalError, `Failed to get safety data: ${err instanceof Error ? err.message : 'Unknown error'}`);
+      // 404 → próbáljuk a fallback headinget
     }
+
+    // 2. Fallback: Safety and Hazards heading
+    if (!ghsData) {
+      try {
+        const r = await axios.get(
+          `https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/data/compound/${cid}/JSON?heading=Safety+and+Hazards`,
+          { timeout: 15000 }
+        );
+        ghsData = r.data;
+      } catch (err: any) {
+        if (err.response?.status !== 404) throw new McpError(ErrorCode.InternalError, `Failed to get safety data: ${err instanceof Error ? err.message : 'Unknown error'}`);
+      }
+    }
+
+    if (!ghsData) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            cid,
+            ghs_available: false,
+            message: 'Nem találhatók GHS biztonsági adatok ehhez a vegyülethez.'
+          })
+        }]
+      };
+    }
+
+    // Struktúrált GHS mezők kinyerése
+    const result: any = {
+      cid,
+      ghs_available:             true,
+      signal_word:               null as string | null,
+      pictograms:                [] as string[],
+      hazard_statements:         [] as string[],  // H-mondatok
+      precautionary_statements:  [] as string[],  // P-mondatok
+      ghs_sources:               [] as string[],
+    };
+
+    function extractSections(sections: any[]): void {
+      for (const section of sections ?? []) {
+        for (const info of section.Information ?? []) {
+          for (const val of info.Value?.StringWithMarkup ?? []) {
+            const str: string = val.String ?? '';
+            if (/danger|warning|veszély|figyelmeztetés/i.test(str)) {
+              result.signal_word = str;
+            } else if (/^H\d{3}/.test(str) && !result.hazard_statements.includes(str)) {
+              result.hazard_statements.push(str);
+            } else if (/^P\d{3}/.test(str) && !result.precautionary_statements.includes(str)) {
+              result.precautionary_statements.push(str);
+            } else if (/GHS\d{2}/i.test(str) && !result.pictograms.includes(str)) {
+              result.pictograms.push(str);
+            }
+          }
+          if (info.Name && !result.ghs_sources.includes(info.Name)) {
+            result.ghs_sources.push(info.Name);
+          }
+        }
+        if (section.Section) extractSections(section.Section);
+      }
+    }
+
+    extractSections(ghsData?.Record?.Section ?? []);
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify(result)
+      }]
+    };
   }
 
   private async handleGetToxicityInfo(args: any) {
@@ -1204,23 +1510,40 @@ class PubChemServer {
     return { content: [{ type: 'text', text: JSON.stringify({ message: 'Literature references not yet implemented', args }, null, 2) }] };
   }
 
+  // FÁZIS 6 — batch_compound_lookup: XLogP és TPSA hozzáadva a property listához
   private async handleBatchCompoundLookup(args: any) {
     if (!isValidBatchArgs(args)) {
       throw new McpError(ErrorCode.InvalidParams, 'Invalid batch arguments');
     }
 
     try {
+      const operation = args.operation || 'property';
+      const cids = args.cids.slice(0, 200);
+
+      if (operation === 'property') {
+        // Batch property fetch — egyetlen API hívás az összes CID-hez
+        const BATCH_PROPS = [
+          'MolecularWeight', 'XLogP', 'TPSA', 'HBondDonorCount',
+          'HBondAcceptorCount', 'RotatableBondCount', 'IUPACName',
+          'CanonicalSMILES', 'InChIKey', 'MolecularFormula'
+        ].join(',');
+        const url = `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/${cids.join(',')}/property/${BATCH_PROPS}/JSON`;
+        const response = await axios.get(url, { timeout: 30000 });
+        return { content: [{ type: 'text', text: JSON.stringify({ operation, cid_count: cids.length, data: response.data }, null, 2) }] };
+      }
+
+      // Egyéb műveletek (synonyms, classification, description) — egyenként
       const results = [];
-      for (const cid of args.cids.slice(0, 10)) {
+      for (const cid of cids.slice(0, 10)) {
         try {
-          const response = await this.apiClient.get(`/compound/cid/${cid}/property/MolecularWeight,CanonicalSMILES,IUPACName/JSON`);
+          const response = await this.apiClient.get(`/compound/cid/${cid}/${operation}/JSON`);
           results.push({ cid, data: response.data, success: true });
         } catch (error) {
           results.push({ cid, error: error instanceof Error ? error.message : 'Unknown error', success: false });
         }
       }
 
-      return { content: [{ type: 'text', text: JSON.stringify({ batch_results: results }, null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify({ operation, batch_results: results }, null, 2) }] };
     } catch (error) {
       throw new McpError(ErrorCode.InternalError, `Batch lookup failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
